@@ -851,8 +851,24 @@ int OPS_ElementalLoad()
       int numdata = OPS_GetNumRemainingInputArgs();
       double data[18];
       if (numdata == 18) {
-	opserr << "eleLoad -shellThermal -- not yet implemented for 9 data points (see Tcl implementation)" << endln;
-	return -1;
+	// 9 temperature points through the thickness (patched: same as Tcl implementation)
+	if (OPS_GetDoubleInput(&numdata, data) < 0) {
+	  opserr << "WARNING eleLoad - invalid input\n";
+	  return -1;
+	}
+	for (int i = 0; i < theEleTags.Size(); i++) {
+	  theLoad = new ShellThermalAction(eleLoadTag,
+		data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+		data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+		data[16], data[17], theEleTags(i));
+	  if (theDomain->addElementalLoad(theLoad, loadPatternTag) == false) {
+	    opserr << "WARNING eleLoad - could not add shellThermal load to domain\n";
+	    delete theLoad;
+	    return -1;
+	  }
+	  eleLoadTag++;
+	}
+	return 0;
       }
       if (numdata == 10) {
 	opserr << "eleLoad -shellThermal -- not yet implemented for 5 data points (see Tcl implementation)" << endln;

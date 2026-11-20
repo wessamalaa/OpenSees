@@ -20,13 +20,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Apply fire patches
+      - name: Apply fire patches (skipped if the branch already contains them)
         shell: bash
         run: |
-          # apply to the index (LF), not the Windows working tree (CRLF after checkout), then refresh the files
-          git apply --cached --whitespace=nowarn opensees_patches.diff
-          git checkout -- SRC
-          git diff --cached --stat
+          if grep -q "sigmaYmax" SRC/material/nD/J2PlateFibre.cpp; then echo "patches already in the source"; else
+            tr -d '\r' < opensees_patches.diff > /tmp/p.diff        # CRLF-safe on Windows runners
+            git apply --cached --whitespace=nowarn /tmp/p.diff && git checkout -- SRC; fi
           grep -c "sigmaYmax" SRC/material/nD/J2PlateFibre.cpp
       - name: Microsoft Visual Studio
         uses: ilammy/msvc-dev-cmd@v1

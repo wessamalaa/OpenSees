@@ -794,6 +794,14 @@ J2Plasticity::setParameter(const char **argv, int argc,
   else if (strcmp(argv[0],"rho") == 0)
     return param.addObject(3, this);
 
+  // (patched) temperature-dependent yield stress for fire analysis
+  else if (strcmp(argv[0],"sigma_0") == 0 || strcmp(argv[0],"fy") == 0)
+    return param.addObject(4, this);
+  else if (strcmp(argv[0],"sigma_infty") == 0)
+    return param.addObject(5, this);
+  else if (strcmp(argv[0],"Hard") == 0 || strcmp(argv[0],"H") == 0)
+    return param.addObject(6, this);
+
   return -1;
 }
 
@@ -809,6 +817,15 @@ J2Plasticity::updateParameter(int parameterID, Information &info)
     return 0;
   case 3:
     rho = info.theDouble;
+    return 0;
+  case 4:
+    sigma_0 = info.theDouble;
+    return 0;
+  case 5:
+    sigma_infty = info.theDouble;
+    return 0;
+  case 6:
+    Hard = info.theDouble;
     return 0;
   default:
     return -1;

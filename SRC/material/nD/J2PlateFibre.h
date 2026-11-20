@@ -93,6 +93,8 @@ class J2PlateFibre : public NDMaterial
 
   double rho;
   double sigmaYn;
+  double sigmaYmax; // (patched) cap on isotropic hardening (EC3 plateau); <= 0 means no cap
+  double epsTh;   // (patched) imposed free thermal strain, subtracted from eps11 and eps22
   
   int parameterID;
   Matrix *SHVs;
