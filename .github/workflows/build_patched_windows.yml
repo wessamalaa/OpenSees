@@ -1,0 +1,125 @@
+# Builds OpenSeesPy for Windows (Python 3.14) WITH the fire patches (J2PlateFibre thermal strain, return-map
+# tolerance, J2Plasticity yield parameters, 9-point -shellThermal).  Adapted from OpenSees' own Windows CI job.
+# Put this file in .github/workflows/ of your fork of OpenSees/OpenSees and opensees_patches.diff in the repo root,
+# then Actions -> "Build patched OpenSeesPy (Windows)" -> Run workflow.  Result: artifact OpenSeesPy_fire_patched.
+name: Build patched OpenSeesPy (Windows)
+on:
+  push:
+    branches: [fire-build]            # pushing the patch to this branch starts the build
+  workflow_dispatch:
+    inputs:
+      python:
+        description: Python version of your PC (python --version)
+        default: "3.14"
+permissions:
+  contents: write                     # lets the job store the result on branch fire-build-output
+jobs:
+  build-win:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply fire patches
+        shell: bash
+        run: git apply --3way --whitespace=nowarn opensees_patches.diff && git diff --stat
+      - name: Microsoft Visual Studio
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: 2022
+      - name: Intel oneAPI (MKL + Fortran)
+        shell: pwsh
+        env:
+          WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/7dff44ba-e3af-4448-841c-0d616c8da6e7/w_BaseKit_p_2024.1.0.595_offline.exe
+          WINDOWS_BASEKIT_COMPONENTS: intel.oneapi.win.mkl.devel
+          WINDOWS_HPCKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/c95a3b26-fc45-496c-833b-df08b10297b9/w_HPCKit_p_2024.1.0.561_offline.exe
+          WINDOWS_HPCKIT_COMPONENTS: "intel.oneapi.win.mpi.devel:intel.oneapi.win.ifort-compiler"
+        working-directory: ${{ github.workspace }}\.github\workflows
+        run: |
+          ./install_fortran.bat $env:WINDOWS_BASEKIT_URL $env:WINDOWS_BASEKIT_COMPONENTS
+          ./install_fortran.bat $env:WINDOWS_HPCKIT_URL $env:WINDOWS_HPCKIT_COMPONENTS
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python || '3.14' }}
+      - name: Install conan
+        run: |
+          pip install conan
+          conan profile detect --force
+      - name: MUMPS
+        shell: cmd
+        run: |
+          git clone https://github.com/OpenSees/mumps.git
+          cd mumps
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 mod
+          cmake -S . -B build -G Ninja -Darith=d -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" -DCMAKE_EXE_LINKER_FLAGS="/link /FORCE:MULTIPLE"  -DCMAKE_SHARED_LINKER_FLAGS="/link /FORCE:MULTIPLE"
+          cd build
+          cmake --build . --config Release
+      - name: Build OpenSeesPy
+        shell: cmd
+        run: |
+          set CMAKE_POLICY_VERSION_MINIMUM=3.5
+          conan install . -s arch=x86_64 -s compiler.runtime=static --build=missing -c tools.cmake.cmaketoolchain:generator=Ninja
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 mod
+          cmake.exe -S . -B build/Release -G "Ninja"  -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" -DCMAKE_Fortran_COMPILER="ifx" -DBLA_STATIC=ON  -DMKL_LINK=static -DMKL_INTERFACE_FULL=intel_lp64  -DMUMPS_DIR="..\..\mumps\build" -DCMAKE_EXE_LINKER_FLAGS="/FORCE:MULTIPLE" -DCMAKE_SHARED_LINKER_FLAGS="/FORCE:MULTIPLE" -DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON
+          cd build/Release
+          cmake --build . --config Release --target OpenSeesPy -j4
+      - name: Check the patch (free thermal expansion of a J2PlateFibre shell = 1.000 mm)
+        shell: pwsh
+        run: |
+          mv ./build/Release/OpenSeesPy.dll ./build/Release/opensees.pyd
+          cp "C:\Program Files (x86)\Intel\oneAPI\compiler\2024.1\bin\libiomp5md.dll" ./build/Release/
+          $env:PYTHONPATH = "./build/Release/"
+          @'
+          import opensees as ops
+          ops.model('basic', '-ndm', 3, '-ndf', 6)
+          ops.nDMaterial('J2PlateFibre', 1, 2.1e11, 0.3, 2.75e8, 4.2e8, 0.0, 0.0, 2.75e8)
+          ops.section('LayeredShell', 1, 4, 1, 0.004, 1, 0.004, 1, 0.004, 1, 0.004)
+          n = 4
+          for j in range(n + 1):
+              for i in range(n + 1): ops.node(j * (n + 1) + i + 1, i / n, j / n, 0.0)
+          e = 0
+          for j in range(n):
+              for i in range(n):
+                  a = j * (n + 1) + i + 1; e += 1
+                  ops.element('ASDShellQ4', e, a, a + 1, a + n + 2, a + n + 1, 1, '-corotational')
+          ops.fix(1, 1, 1, 1, 1, 1, 1); ops.fix(n + 1, 0, 1, 1, 0, 0, 0)
+          ops.constraints('Plain'); ops.numberer('RCM'); ops.system('UmfPack')
+          ops.test('NormDispIncr', 1e-10, 20); ops.algorithm('Newton'); ops.integrator('LoadControl', 0.0); ops.analysis('Static')
+          for k in range(1, 11):                     # thermal strain raised in 10 small steps to 1e-3
+              ops.setParameter('-val', 1.0e-4 * k, '-ele', *range(1, e + 1), 'epsTh'); ops.analyze(1)
+          u = ops.nodeDisp((n + 1) ** 2, 1) * 1000
+          print('far-corner expansion = %.4f mm (expected 1.0000)' % u)
+          assert abs(u - 1.0) < 1e-3, 'patch NOT active'
+          # EC3 plateau: fy 200 MPa, H 5 GPa, cap fyMax 220 MPa, plate stretched to 3 % strain
+          ops.wipe(); ops.model('basic', '-ndm', 3, '-ndf', 6)
+          ops.nDMaterial('J2PlateFibre', 1, 2.1e11, 0.3, 2.0e8, 5.0e9, 0.0, 0.0, 2.0e8)
+          ops.section('LayeredShell', 1, 3, 1, 0.004, 1, 0.004, 1, 0.004)
+          for i, (x, y) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))): ops.node(i + 1, float(x), float(y), 0.0)
+          ops.element('ASDShellQ4', 1, 1, 2, 3, 4, 1)
+          ops.setParameter('-val', 2.2e8, '-ele', 1, 'fyMax')
+          ops.fix(1, 1, 1, 1, 1, 1, 1); ops.fix(4, 1, 0, 1, 1, 1, 1); ops.fix(2, 0, 1, 1, 1, 1, 1); ops.fix(3, 0, 0, 1, 1, 1, 1)
+          ops.timeSeries('Linear', 1); ops.pattern('Plain', 1, 1); ops.sp(2, 1, 1.0); ops.sp(3, 1, 1.0)
+          ops.constraints('Penalty', 1e16, 1e16); ops.numberer('Plain'); ops.system('FullGeneral')
+          ops.test('NormDispIncr', 1e-10, 30); ops.algorithm('Newton'); ops.integrator('LoadControl', 0.001); ops.analysis('Static')
+          ops.analyze(30); ops.reactions()
+          s = -(ops.nodeReaction(1, 1) + ops.nodeReaction(4, 1)) / 0.012 / 1e6
+          print('stress at 3 %% strain with fyMax = 220 MPa: %.1f MPa (expected about 224; 345 without the cap)' % s)
+          assert s < 260, 'fyMax cap NOT active'
+          '@ | Out-File -Encoding utf8 check.py
+          python check.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenSeesPy_fire_patched
+          path: |
+            ./build/Release/opensees.pyd
+            ./build/Release/libiomp5md.dll
+      - name: Store the result on branch fire-build-output (downloadable with plain git)
+        shell: bash
+        run: |
+          mkdir -p /tmp/out && cp ./build/Release/opensees.pyd ./build/Release/libiomp5md.dll /tmp/out/
+          cd /tmp/out
+          git init -q -b fire-build-output
+          git config user.name "fire-build-bot"; git config user.email "fire-build-bot@users.noreply.github.com"
+          echo "Built from ${GITHUB_SHA} on $(date -u)" > BUILD_INFO.txt
+          git add -A && git commit -q -m "Patched OpenSeesPy for Windows (Python ${{ inputs.python || '3.14' }})"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" fire-build-output

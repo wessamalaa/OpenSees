@@ -1,0 +1,347 @@
+diff --git a/SRC/interpreter/OpenSeesPatternCommands.cpp b/SRC/interpreter/OpenSeesPatternCommands.cpp
+index 7e75123..c38e00a 100644
+--- a/SRC/interpreter/OpenSeesPatternCommands.cpp
++++ b/SRC/interpreter/OpenSeesPatternCommands.cpp
+@@ -851,8 +851,24 @@ int OPS_ElementalLoad()
+       int numdata = OPS_GetNumRemainingInputArgs();
+       double data[18];
+       if (numdata == 18) {
+-	opserr << "eleLoad -shellThermal -- not yet implemented for 9 data points (see Tcl implementation)" << endln;
+-	return -1;
++	// 9 temperature points through the thickness (patched: same as Tcl implementation)
++	if (OPS_GetDoubleInput(&numdata, data) < 0) {
++	  opserr << "WARNING eleLoad - invalid input\n";
++	  return -1;
++	}
++	for (int i = 0; i < theEleTags.Size(); i++) {
++	  theLoad = new ShellThermalAction(eleLoadTag,
++		data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
++		data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
++		data[16], data[17], theEleTags(i));
++	  if (theDomain->addElementalLoad(theLoad, loadPatternTag) == false) {
++	    opserr << "WARNING eleLoad - could not add shellThermal load to domain\n";
++	    delete theLoad;
++	    return -1;
++	  }
++	  eleLoadTag++;
++	}
++	return 0;
+       }
+       if (numdata == 10) {
+ 	opserr << "eleLoad -shellThermal -- not yet implemented for 5 data points (see Tcl implementation)" << endln;
+diff --git a/SRC/material/nD/J2Plasticity.cpp b/SRC/material/nD/J2Plasticity.cpp
+index 7fa3070..b1989fa 100644
+--- a/SRC/material/nD/J2Plasticity.cpp
++++ b/SRC/material/nD/J2Plasticity.cpp
+@@ -794,6 +794,14 @@ J2Plasticity::setParameter(const char **argv, int argc,
+   else if (strcmp(argv[0],"rho") == 0)
+     return param.addObject(3, this);
+ 
++  // (patched) temperature-dependent yield stress for fire analysis
++  else if (strcmp(argv[0],"sigma_0") == 0 || strcmp(argv[0],"fy") == 0)
++    return param.addObject(4, this);
++  else if (strcmp(argv[0],"sigma_infty") == 0)
++    return param.addObject(5, this);
++  else if (strcmp(argv[0],"Hard") == 0 || strcmp(argv[0],"H") == 0)
++    return param.addObject(6, this);
++
+   return -1;
+ }
+ 
+@@ -810,6 +818,15 @@ J2Plasticity::updateParameter(int parameterID, Information &info)
+   case 3:
+     rho = info.theDouble;
+     return 0;
++  case 4:
++    sigma_0 = info.theDouble;
++    return 0;
++  case 5:
++    sigma_infty = info.theDouble;
++    return 0;
++  case 6:
++    Hard = info.theDouble;
++    return 0;
+   default:
+     return -1;
+   }
+diff --git a/SRC/material/nD/J2PlateFibre.cpp b/SRC/material/nD/J2PlateFibre.cpp
+index f38edbf..916adc2 100644
+--- a/SRC/material/nD/J2PlateFibre.cpp
++++ b/SRC/material/nD/J2PlateFibre.cpp
+@@ -99,7 +99,7 @@ J2PlateFibre::J2PlateFibre
+ (int tag, double e, double g, double sy, double hi, double hk, double r, double syn):
+   NDMaterial(tag, ND_TAG_J2PlateFibre),
+   E(e), nu(g), sigmaY(sy), Hiso(hi), Hkin(hk),
+-  rho(r), sigmaYn(syn),
++  rho(r), sigmaYn(syn), epsTh(0.0), sigmaYmax(0.0),
+   parameterID(0), SHVs(0), Tepsilon(5), dg_n1(0.0)
+ {
+   sigmaY = fabs(sigmaY);
+@@ -124,7 +124,7 @@ J2PlateFibre::J2PlateFibre
+ J2PlateFibre::J2PlateFibre():
+   NDMaterial(0, ND_TAG_J2PlateFibre),
+   E(0.0), nu(0.0), sigmaY(0.0), Hiso(0.0), Hkin(0.0),
+-  rho(0.0), sigmaYn(0.0),
++  rho(0.0), sigmaYn(0.0), epsTh(0.0), sigmaYmax(0.0),
+   parameterID(0), SHVs(0), Tepsilon(5), dg_n1(0.0)
+ {
+   epsPn[0] = 0.0;
+@@ -153,6 +153,7 @@ int
+ J2PlateFibre::setTrialStrain (const Vector &strain)
+ {
+   Tepsilon = strain;
++  Tepsilon(0) -= epsTh; Tepsilon(1) -= epsTh;   // (patched) mechanical = total - thermal
+ 
+   return 0;
+ }
+@@ -161,6 +162,7 @@ int
+ J2PlateFibre::setTrialStrain (const Vector &strain, const Vector &rate)
+ {
+   Tepsilon = strain;
++  Tepsilon(0) -= epsTh; Tepsilon(1) -= epsTh;   // (patched)
+ 
+   return 0;
+ }
+@@ -211,6 +213,8 @@ J2PlateFibre::getTangent (void)
+   double Fy = sigmaY;
+   if (p < 0)
+     Fy = sigmaYn;
++  double Hl = Hiso;                                       // (patched) EC3 plateau: yield capped at sigmaYmax
++  if (sigmaYmax > 0.0 && Fy + Hiso*alphan >= sigmaYmax) { Fy = sigmaYmax; Hl = 0.0; }
+   
+   static const double one3 = 1.0/3;
+   static const double two3 = 2.0*one3;
+@@ -227,7 +231,7 @@ J2PlateFibre::getTangent (void)
+ 
+   double q = sqrt(two3*(xsi[0]*xsi[0] + xsi[1]*xsi[1] - xsi[0]*xsi[1]) +
+ 		  2.0*(xsi[2]*xsi[2] + xsi[3]*xsi[3] + xsi[4]*xsi[4]));
+-  double F = q - root23*(Fy + Hiso*alphan);
++  double F = q - root23*(Fy + Hl*alphan);
+ 
+   if (F < -100*DBL_EPSILON) {
+     D.Zero();
+@@ -247,21 +251,24 @@ J2PlateFibre::getTangent (void)
+ 
+     // Solve for dg
+     double dg = 0.0;
+-
++    const double q0 = q;                                    // (patched)
+     static Vector R(6);
+     static Vector x(6);
++    static Matrix J(6,6);
++    static Vector dx(6);
++    for (int pass = 0; pass < 2; pass++) {                  // (patched) redo on the plateau if the cap is crossed
++    dg = 0.0; q = q0;
++
+     x(0) = xsi[0]; R(0) = 0.0;
+     x(1) = xsi[1]; R(1) = 0.0;
+     x(2) = xsi[2]; R(2) = 0.0;
+     x(3) = xsi[3]; R(3) = 0.0;
+     x(4) = xsi[4]; R(4) = 0.0;
+-    x(5) = dg;     R(5) = F;
++    x(5) = dg;     R(5) = q - root23*(Fy + Hl*alphan);   // (patched) = F on pass 0
+ 
+-    static Matrix J(6,6);
+-    static Vector dx(6);
+ 
+     int iter = 0; int maxIter = 25;
+-    while (iter < maxIter && R.Norm() > 1.0e-14) {
++    while (iter < maxIter && R.Norm() > 1.0e-10*(fabs(sigmaY)+fabs(sigmaYn)+1.0)) {   // (patched) relative tolerance
+       iter++;
+ 
+       J(0,0) = 1.0 + dg*(two3*C00-one3*C01+two3Hkin); J(0,1) = dg*(two3*C01-one3*C00);
+@@ -276,13 +283,13 @@ J2PlateFibre::getTangent (void)
+       J(3,5) = (twoG+two3Hkin)*x(3);
+       J(4,5) = (twoG+two3Hkin)*x(4);
+ 
+-      J(5,0) = (1.0-two3*Hiso*dg)*(two3*x(0)-one3*x(1))/q;
+-      J(5,1) = (1.0-two3*Hiso*dg)*(two3*x(1)-one3*x(0))/q;
+-      J(5,2) = (1.0-two3*Hiso*dg)*2.0*x(2)/q;
+-      J(5,3) = (1.0-two3*Hiso*dg)*2.0*x(3)/q;
+-      J(5,4) = (1.0-two3*Hiso*dg)*2.0*x(4)/q;
++      J(5,0) = (1.0-two3*Hl*dg)*(two3*x(0)-one3*x(1))/q;
++      J(5,1) = (1.0-two3*Hl*dg)*(two3*x(1)-one3*x(0))/q;
++      J(5,2) = (1.0-two3*Hl*dg)*2.0*x(2)/q;
++      J(5,3) = (1.0-two3*Hl*dg)*2.0*x(3)/q;
++      J(5,4) = (1.0-two3*Hl*dg)*2.0*x(4)/q;
+ 
+-      J(5,5) = -two3*Hiso*q;
++      J(5,5) = -two3*Hl*q;
+ 
+       J.Solve(R, dx);
+       x.addVector(1.0, dx, -1.0);
+@@ -297,7 +304,7 @@ J2PlateFibre::getTangent (void)
+       R(2) = x(2) - xsi[2] + dg*(twoG+two3Hkin)*x(2);
+       R(3) = x(3) - xsi[3] + dg*(twoG+two3Hkin)*x(3);
+       R(4) = x(4) - xsi[4] + dg*(twoG+two3Hkin)*x(4);
+-      R(5) = q - root23*(Fy + Hiso*(alphan+dg*root23*q));
++      R(5) = q - root23*(Fy + Hl*(alphan+dg*root23*q));
+     }
+ 
+     if (iter == maxIter) {
+@@ -305,6 +312,9 @@ J2PlateFibre::getTangent (void)
+     }
+ 
+     alphan1 = alphan + dg*root23*q;
++    if (pass == 0 && sigmaYmax > 0.0 && Hl > 0.0 && Fy + Hl*alphan1 > sigmaYmax) { Fy = sigmaYmax; Hl = 0.0; continue; }
++    break;
++    }                                                       // (patched) end pass loop
+ 
+     epsPn1[0] = epsPn[0] + dg*(two3*x(0)-one3*x(1));
+     epsPn1[1] = epsPn[1] + dg*(two3*x(1)-one3*x(0));
+@@ -331,13 +341,13 @@ J2PlateFibre::getTangent (void)
+     J(3,5) = (twoG - dg*twoG/beta*two3Hkin)*x(3);
+     J(4,5) = (twoG - dg*twoG/beta*two3Hkin)*x(4);
+ 
+-    J(5,0) = (1.0-two3*Hiso*dg)*(two3*x(0)-one3*x(1))/q/beta;
+-    J(5,1) = (1.0-two3*Hiso*dg)*(two3*x(1)-one3*x(0))/q/beta;
+-    J(5,2) = (1.0-two3*Hiso*dg)*x(2)/q*2.0/beta;
+-    J(5,3) = (1.0-two3*Hiso*dg)*x(3)/q*2.0/beta;
+-    J(5,4) = (1.0-two3*Hiso*dg)*x(4)/q*2.0/beta;
++    J(5,0) = (1.0-two3*Hl*dg)*(two3*x(0)-one3*x(1))/q/beta;
++    J(5,1) = (1.0-two3*Hl*dg)*(two3*x(1)-one3*x(0))/q/beta;
++    J(5,2) = (1.0-two3*Hl*dg)*x(2)/q*2.0/beta;
++    J(5,3) = (1.0-two3*Hl*dg)*x(3)/q*2.0/beta;
++    J(5,4) = (1.0-two3*Hl*dg)*x(4)/q*2.0/beta;
+ 
+-    J(5,5) = -q*two3Hkin/beta - two3*Hiso*q;
++    J(5,5) = -q*two3Hkin/beta - two3*Hl*q;
+ 
+     static Matrix invJ(6,6);
+     J.Invert(invJ);
+@@ -426,6 +436,8 @@ J2PlateFibre::getStress (void)
+   double Fy = sigmaY;
+   if (p < 0)
+     Fy = sigmaYn;
++  double Hl = Hiso;                                       // (patched) EC3 plateau: yield capped at sigmaYmax
++  if (sigmaYmax > 0.0 && Fy + Hiso*alphan >= sigmaYmax) { Fy = sigmaYmax; Hl = 0.0; }
+   
+   static const double one3 = 1.0/3;
+   static const double two3 = 2.0*one3;
+@@ -442,7 +454,7 @@ J2PlateFibre::getStress (void)
+ 
+   double q = sqrt(two3*(xsi[0]*xsi[0] + xsi[1]*xsi[1] - xsi[0]*xsi[1]) +
+ 		  2.0*(xsi[2]*xsi[2] + xsi[3]*xsi[3] + xsi[4]*xsi[4]));
+-  double F = q - root23*(Fy + Hiso*alphan);
++  double F = q - root23*(Fy + Hl*alphan);
+ 
+   if (F < -100*DBL_EPSILON) {
+     epsPn1[0] = epsPn[0];
+@@ -454,21 +466,24 @@ J2PlateFibre::getStress (void)
+   else {
+     // Solve for dg
+     double dg = 0.0;
+-
++    const double q0 = q;                                    // (patched)
+     static Vector R(6);
+     static Vector x(6);
++    static Matrix J(6,6);
++    static Vector dx(6);
++    for (int pass = 0; pass < 2; pass++) {                  // (patched) redo on the plateau if the cap is crossed
++    dg = 0.0; q = q0;
++
+     x(0) = xsi[0]; R(0) = 0.0;
+     x(1) = xsi[1]; R(1) = 0.0;
+     x(2) = xsi[2]; R(2) = 0.0;
+     x(3) = xsi[3]; R(3) = 0.0;
+     x(4) = xsi[4]; R(4) = 0.0;
+-    x(5) = dg;     R(5) = F;
++    x(5) = dg;     R(5) = q - root23*(Fy + Hl*alphan);   // (patched) = F on pass 0
+ 
+-    static Matrix J(6,6);
+-    static Vector dx(6);
+ 
+     int iter = 0; int maxIter = 25;
+-    while (iter < maxIter && R.Norm() > 1.0e-14) {
++    while (iter < maxIter && R.Norm() > 1.0e-10*(fabs(sigmaY)+fabs(sigmaYn)+1.0)) {   // (patched) relative tolerance
+       iter++;
+ 
+       J(0,0) = 1.0 + dg*(two3*C00-one3*C01+two3Hkin); J(0,1) = dg*(two3*C01-one3*C00);
+@@ -483,13 +498,13 @@ J2PlateFibre::getStress (void)
+       J(3,5) = (twoG+two3Hkin)*x(3);
+       J(4,5) = (twoG+two3Hkin)*x(4);
+ 
+-      J(5,0) = (1.0-two3*Hiso*dg)*(two3*x(0)-one3*x(1))/q;
+-      J(5,1) = (1.0-two3*Hiso*dg)*(two3*x(1)-one3*x(0))/q;
+-      J(5,2) = (1.0-two3*Hiso*dg)*2.0*x(2)/q;
+-      J(5,3) = (1.0-two3*Hiso*dg)*2.0*x(3)/q;
+-      J(5,4) = (1.0-two3*Hiso*dg)*2.0*x(4)/q;
++      J(5,0) = (1.0-two3*Hl*dg)*(two3*x(0)-one3*x(1))/q;
++      J(5,1) = (1.0-two3*Hl*dg)*(two3*x(1)-one3*x(0))/q;
++      J(5,2) = (1.0-two3*Hl*dg)*2.0*x(2)/q;
++      J(5,3) = (1.0-two3*Hl*dg)*2.0*x(3)/q;
++      J(5,4) = (1.0-two3*Hl*dg)*2.0*x(4)/q;
+ 
+-      J(5,5) = -two3*Hiso*q;
++      J(5,5) = -two3*Hl*q;
+ 
+       J.Solve(R, dx);
+       x.addVector(1.0, dx, -1.0);
+@@ -504,13 +519,16 @@ J2PlateFibre::getStress (void)
+       R(2) = x(2) - xsi[2] + dg*(twoG+two3Hkin)*x(2);
+       R(3) = x(3) - xsi[3] + dg*(twoG+two3Hkin)*x(3);
+       R(4) = x(4) - xsi[4] + dg*(twoG+two3Hkin)*x(4);
+-      R(5) = q - root23*(Fy + Hiso*(alphan+dg*root23*q));
++      R(5) = q - root23*(Fy + Hl*(alphan+dg*root23*q));
+     }
+     if (iter == maxIter) {
+       //opserr << "J2PlateFibre::getStress -- maxIter reached " << R.Norm() << endln;
+     }
+ 
+     alphan1 = alphan + dg*root23*q;
++    if (pass == 0 && sigmaYmax > 0.0 && Hl > 0.0 && Fy + Hl*alphan1 > sigmaYmax) { Fy = sigmaYmax; Hl = 0.0; continue; }
++    break;
++    }                                                       // (patched) end pass loop
+ 
+     epsPn1[0] = epsPn[0] + dg*(two3*x(0)-one3*x(1));
+     epsPn1[1] = epsPn[1] + dg*(two3*x(1)-one3*x(0));
+@@ -596,6 +614,8 @@ J2PlateFibre::getCopy (void)
+   J2PlateFibre *theCopy =
+     new J2PlateFibre (this->getTag(), E, nu, sigmaY, Hiso, Hkin, rho, sigmaYn);
+ 
++  theCopy->epsTh = epsTh;
++  theCopy->sigmaYmax = sigmaYmax;   // (patched)
+   return theCopy;
+ }
+ 
+@@ -1009,6 +1029,14 @@ J2PlateFibre::setParameter(const char **argv, int argc,
+     param.setValue(Hiso);
+     return param.addObject(7, this);
+   }
++  else if (strcmp(argv[0],"fyMax") == 0 || strcmp(argv[0],"sigmaYmax") == 0) {   // (patched) hardening cap (EC3 plateau)
++    param.setValue(sigmaYmax);
++    return param.addObject(10, this);
++  }
++  else if (strcmp(argv[0],"epsTh") == 0) {      // (patched) thermal strain
++    param.setValue(epsTh);
++    return param.addObject(9, this);
++  }
+   else if (strcmp(argv[0],"sigmaYn") == 0 || strcmp(argv[0],"fyn") == 0 || strcmp(argv[0],"Fyn") == 0) {
+     param.setValue(sigmaYn);
+     return param.addObject(8, this);
+@@ -1036,6 +1064,12 @@ J2PlateFibre::updateParameter(int parameterID, Information &info)
+   case 6:
+     Hkin = info.theDouble;
+     return 0;
++  case 9:
++    epsTh = info.theDouble;
++    return 0;
++  case 10:                                      // (patched)
++    sigmaYmax = info.theDouble;
++    return 0;
+   case 7:
+     Hiso = info.theDouble;
+     return 0;
+diff --git a/SRC/material/nD/J2PlateFibre.h b/SRC/material/nD/J2PlateFibre.h
+index b8fbfa0..7f7ac61 100644
+--- a/SRC/material/nD/J2PlateFibre.h
++++ b/SRC/material/nD/J2PlateFibre.h
+@@ -93,6 +93,8 @@ class J2PlateFibre : public NDMaterial
+ 
+   double rho;
+   double sigmaYn;
++  double sigmaYmax; // (patched) cap on isotropic hardening (EC3 plateau); <= 0 means no cap
++  double epsTh;   // (patched) imposed free thermal strain, subtracted from eps11 and eps22
+   
+   int parameterID;
+   Matrix *SHVs;
