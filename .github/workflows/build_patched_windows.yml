@@ -22,7 +22,12 @@ jobs:
           fetch-depth: 0
       - name: Apply fire patches
         shell: bash
-        run: git apply --3way --whitespace=nowarn opensees_patches.diff && git diff --stat
+        run: |
+          # apply to the index (LF), not the Windows working tree (CRLF after checkout), then refresh the files
+          git apply --cached --whitespace=nowarn opensees_patches.diff
+          git checkout -- SRC
+          git diff --cached --stat
+          grep -c "sigmaYmax" SRC/material/nD/J2PlateFibre.cpp
       - name: Microsoft Visual Studio
         uses: ilammy/msvc-dev-cmd@v1
         with:
